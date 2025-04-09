@@ -11,30 +11,33 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    // Read environment variables
-    const env = try std.process.env_map(allocator);
-    defer env.deinit();
+    // Read environment variables - fix for older Zig versions
+    var env_map = std.process.getEnvMap(allocator) catch |err| {
+        std.debug.print("Failed to get environment variables: {any}\n", .{err});
+        return err;
+    };
+    defer env_map.deinit();
 
     // Get Telegram token (must be passed as environment variable)
-    const telegram_token = env.get("TELEGRAM_TOKEN") orelse {
+    const telegram_token = env_map.get("TELEGRAM_TOKEN") orelse {
         std.debug.print("ERROR: TELEGRAM_TOKEN environment variable not set\n", .{});
         return error.MissingTelegramToken;
     };
 
     // OpenAI settings
-    const openapi_baseurl = env.get("OPENAPI_BASEURL") orelse {
+    const openapi_baseurl = env_map.get("OPENAPI_BASEURL") orelse {
         std.debug.print("ERROR: OPENAPI_BASEURL environment variable not set\n", .{});
         return error.MissingOpenAIBaseURL;
     };
-    const openapi_token = env.get("OPENAPI_TOKEN") orelse {
+    const openapi_token = env_map.get("OPENAPI_TOKEN") orelse {
         std.debug.print("ERROR: OPENAPI_TOKEN environment variable not set\n", .{});
         return error.MissingOpenAIToken;
     };
-    const openapi_model = env.get("OPENAPI_MODEL") orelse {
+    const openapi_model = env_map.get("OPENAPI_MODEL") orelse {
         std.debug.print("ERROR: OPENAPI_MODEL environment variable not set\n", .{});
         return error.MissingOpenAIModel;
     };
-    const system_msg = env.get("SYSTEM_MSG") orelse "You are a helpful assistant.";
+    const system_msg = env_map.get("SYSTEM_MSG") orelse "You are a helpful assistant.";
 
     // Get bot info to determine bot username
     std.debug.print("Starting bot...\n", .{});
