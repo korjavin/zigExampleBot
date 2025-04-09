@@ -2,7 +2,7 @@
 FROM debian:bullseye-slim as build
 
 # Install dependencies
-RUN apt-get update && apt-get install -y wget tar xz-utils build-essential && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y wget tar xz-utils build-essential curl && rm -rf /var/lib/apt/lists/*
 
 # Install Zig
 WORKDIR /zig
@@ -17,12 +17,14 @@ WORKDIR /app
 # Copy the project files into the container
 COPY . .
 
-
-
 # Build the Zig application
-RUN zig build 
+RUN zig build
+
 # Use a minimal base image for the final container
 FROM debian:bullseye-slim
+
+# Install curl for HTTP requests
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory
 WORKDIR /app

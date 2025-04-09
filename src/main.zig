@@ -1,6 +1,4 @@
 const std = @import("std");
-const http = @import("std").net.http;
-const json = std.json;
 
 // Telegram bot specific constants
 const telegram_api_base_url = "https://api.telegram.org/bot";
@@ -51,22 +49,7 @@ pub fn main() !void {
     while (true) {
         // Get updates from Telegram
         const updates = try getUpdates(allocator, telegram_token, last_update_id + 1);
-        defer {
-            for (updates.items) |update| {
-                // Free memory for each message
-                if (update.message) |msg| {
-                    if (msg.text) |text| {
-                        allocator.free(text);
-                    }
-                    if (msg.from) |from| {
-                        allocator.free(from.username);
-                        allocator.free(from.first_name);
-                    }
-                }
-            }
-            updates.deinit();
-        }
-
+        
         // Process updates
         for (updates.items) |update| {
             // Update the last_update_id to get new updates next time
@@ -102,6 +85,8 @@ pub fn main() !void {
             }
         }
 
+        updates.deinit();
+
         // Sleep for a short time to avoid hammering the Telegram API
         std.time.sleep(1 * std.time.ns_per_s);
     }
@@ -112,49 +97,34 @@ const BotInfo = struct {
     username: []const u8,
 };
 
-// Get bot information (username, etc.)
+// Get bot information (username, etc.) using curl
 fn getBotInfo(allocator: std.mem.Allocator, token: []const u8) !BotInfo {
     const url = try std.fmt.allocPrint(allocator, "{s}{s}/getMe", .{telegram_api_base_url, token});
     defer allocator.free(url);
 
-    var client = try http.Client.init(allocator);
-    defer client.deinit();
-
-    var headers = std.ArrayList(http.Header).init(allocator);
-    defer headers.deinit();
-
-    try headers.append(http.Header{ .name = "Content-Type", .value = "application/json" });
-
-    const response = try client.request(.{
-        .method = .get,
+    const response = try curlRequest(allocator, .{
+        .method = "GET",
         .url = url,
-        .headers = &headers,
+        .body = null,
+        .headers = &[_][]const u8{"Content-Type: application/json"},
     });
-    defer response.deinit();
+    defer allocator.free(response);
 
-    if (response.status_code != 200) {
-        std.debug.print("Error getting bot info: status code {d}\n", .{response.status_code});
-        return error.TelegramApiError;
+    // Parse JSON response manually to extract bot username
+    // Look for "username":"BOTNAME" pattern
+    const username_prefix = "\"username\":\"";
+    if (std.mem.indexOf(u8, response, username_prefix)) |username_start| {
+        const start_idx = username_start + username_prefix.len;
+        const end_idx = std.mem.indexOfPos(u8, response, start_idx, "\"") orelse return error.InvalidResponse;
+        return BotInfo{
+            .username = try allocator.dupe(u8, response[start_idx..end_idx]),
+        };
+    } else {
+        return error.UsernameNotFound;
     }
-
-    const response_body = try response.body.toOwnedSlice(allocator);
-    defer allocator.free(response_body);
-
-    // Parse JSON response to get bot username
-    var json_parser = std.json.Parser.init(allocator, false);
-    defer json_parser.deinit();
-
-    var parsed_data = try json_parser.parse(response_body);
-    defer parsed_data.deinit();
-
-    const root = parsed_data.root.Object;
-    const result = root.get("result").?.Object;
-    const username = try allocator.dupe(u8, result.get("username").?.String);
-
-    return BotInfo{ .username = username };
 }
 
-// Telegram Update structure
+// Simple update structure
 const Update = struct {
     update_id: i64,
     message: ?Message,
@@ -165,104 +135,136 @@ const Message = struct {
     message_id: i64,
     chat_id: i64,
     text: ?[]const u8,
-    from: ?User,
 };
 
-// User structure
-const User = struct {
-    username: []const u8,
-    first_name: []const u8,
-};
+const ArrayList = std.ArrayList;
 
-// Get updates from Telegram
-fn getUpdates(allocator: std.mem.Allocator, token: []const u8, offset: i64) !std.ArrayList(Update) {
-    const url = try std.fmt.allocPrint(allocator, "{s}{s}/getUpdates?offset={d}&timeout={d}", 
+// Get updates from Telegram using curl
+fn getUpdates(allocator: std.mem.Allocator, token: []const u8, offset: i64) !ArrayList(Update) {
+    const url = try std.fmt.allocPrint(allocator, "{s}{s}/getUpdates?offset={d}&timeout={d}",
         .{telegram_api_base_url, token, offset, polling_timeout});
     defer allocator.free(url);
 
-    var client = try http.Client.init(allocator);
-    defer client.deinit();
-
-    var headers = std.ArrayList(http.Header).init(allocator);
-    defer headers.deinit();
-
-    try headers.append(http.Header{ .name = "Content-Type", .value = "application/json" });
-
-    const response = try client.request(.{
-        .method = .get,
+    const response = try curlRequest(allocator, .{
+        .method = "GET",
         .url = url,
-        .headers = &headers,
+        .body = null,
+        .headers = &[_][]const u8{"Content-Type: application/json"},
     });
-    defer response.deinit();
+    defer allocator.free(response);
 
-    if (response.status_code != 200) {
-        std.debug.print("Error getting updates: status code {d}\n", .{response.status_code});
-        return error.TelegramApiError;
-    }
-
-    const response_body = try response.body.toOwnedSlice(allocator);
-    defer allocator.free(response_body);
-
-    // Parse JSON response
-    var json_parser = std.json.Parser.init(allocator, false);
-    defer json_parser.deinit();
-
-    var parsed_data = try json_parser.parse(response_body);
-    defer parsed_data.deinit();
-
-    // Extract updates from the JSON
-    var updates = std.ArrayList(Update).init(allocator);
+    // Parse JSON response manually to extract updates
+    var updates = ArrayList(Update).init(allocator);
     errdefer updates.deinit();
 
-    const root = parsed_data.root.Object;
-    const result = root.get("result").?.Array;
+    // Locate the "result" array
+    const result_start = std.mem.indexOf(u8, response, "\"result\":[") orelse return updates;
+    var json_pos = result_start + "\"result\":[".len;
 
-    for (result.items) |item| {
-        const update_obj = item.Object;
+    // Parse each update object
+    while (json_pos < response.len) {
+        // Find the start of the update object
+        const update_start = std.mem.indexOfPos(u8, response, json_pos, "{") orelse break;
+        json_pos = update_start + 1;
+
+        // Find the end of this update object
+        var brace_depth: usize = 1;
+        var update_end: usize = update_start + 1;
+        while (brace_depth > 0 and update_end < response.len) {
+            if (response[update_end] == '{') {
+                brace_depth += 1;
+            } else if (response[update_end] == '}') {
+                brace_depth -= 1;
+            }
+            update_end += 1;
+        }
+        
+        if (brace_depth != 0) break; // Malformed JSON
+        
+        // Extract update_id
+        const update_id_prefix = "\"update_id\":";
+        const update_id_start = std.mem.indexOfPos(u8, response, update_start, update_id_prefix) orelse break;
+        const id_start = update_id_start + update_id_prefix.len;
+        const id_end = std.mem.indexOfPos(u8, response, id_start, ",") orelse std.mem.indexOfPos(u8, response, id_start, "}") orelse break;
+        
+        const update_id_str = std.mem.trim(u8, response[id_start..id_end], " \t\n\r");
+        const update_id = std.fmt.parseInt(i64, update_id_str, 10) catch break;
+        
+        // Create a new update
         var update = Update{
-            .update_id = update_obj.get("update_id").?.Integer,
+            .update_id = update_id,
             .message = null,
         };
-
-        if (update_obj.get("message")) |msg_value| {
-            const msg_obj = msg_value.Object;
-            var message = Message{
-                .message_id = msg_obj.get("message_id").?.Integer,
-                .chat_id = msg_obj.get("chat").?.Object.get("id").?.Integer,
-                .text = null,
-                .from = null,
-            };
-
-            if (msg_obj.get("text")) |text_value| {
-                message.text = try allocator.dupe(u8, text_value.String);
-            }
-
-            if (msg_obj.get("from")) |from_value| {
-                const from_obj = from_value.Object;
-                var user = User{
-                    .username = "",
-                    .first_name = "",
-                };
-
-                if (from_obj.get("username")) |username_value| {
-                    user.username = try allocator.dupe(u8, username_value.String);
+        
+        // Look for message
+        const message_start = std.mem.indexOfPos(u8, response, update_start, "\"message\":{") orelse {
+            try updates.append(update);
+            json_pos = update_end;
+            continue;
+        };
+        
+        // Extract message_id
+        const message_id_prefix = "\"message_id\":";
+        const message_id_start = std.mem.indexOfPos(u8, response, message_start, message_id_prefix) orelse {
+            try updates.append(update);
+            json_pos = update_end;
+            continue;
+        };
+        
+        const msg_id_start = message_id_start + message_id_prefix.len;
+        const msg_id_end = std.mem.indexOfPos(u8, response, msg_id_start, ",") orelse std.mem.indexOfPos(u8, response, msg_id_start, "}") orelse break;
+        
+        const message_id_str = std.mem.trim(u8, response[msg_id_start..msg_id_end], " \t\n\r");
+        const message_id = std.fmt.parseInt(i64, message_id_str, 10) catch break;
+        
+        // Extract chat_id
+        const chat_id_prefix = "\"chat\":{\"id\":";
+        const chat_id_start = std.mem.indexOfPos(u8, response, message_start, chat_id_prefix) orelse {
+            try updates.append(update);
+            json_pos = update_end;
+            continue;
+        };
+        
+        const chat_id_value_start = chat_id_start + chat_id_prefix.len;
+        const chat_id_end = std.mem.indexOfPos(u8, response, chat_id_value_start, ",") orelse std.mem.indexOfPos(u8, response, chat_id_value_start, "}") orelse break;
+        
+        const chat_id_str = std.mem.trim(u8, response[chat_id_value_start..chat_id_end], " \t\n\r");
+        const chat_id = std.fmt.parseInt(i64, chat_id_str, 10) catch break;
+        
+        // Look for text
+        var text: ?[]const u8 = null;
+        const text_prefix = "\"text\":\"";
+        if (std.mem.indexOfPos(u8, response, message_start, text_prefix)) |text_start| {
+            const text_content_start = text_start + text_prefix.len;
+            var text_end = text_content_start;
+            var escaped = false;
+            
+            // Find the closing quote, handling escaped quotes
+            while (text_end < response.len) {
+                if (response[text_end] == '\\') {
+                    escaped = !escaped;
+                } else if (response[text_end] == '"' and !escaped) {
+                    break;
                 } else {
-                    user.username = try allocator.dupe(u8, "");
+                    escaped = false;
                 }
-
-                if (from_obj.get("first_name")) |first_name_value| {
-                    user.first_name = try allocator.dupe(u8, first_name_value.String);
-                } else {
-                    user.first_name = try allocator.dupe(u8, "");
-                }
-
-                message.from = user;
+                text_end += 1;
             }
-
-            update.message = message;
+            
+            if (text_end < response.len) {
+                text = try allocator.dupe(u8, response[text_content_start..text_end]);
+            }
         }
-
+        
+        // Create the message
+        update.message = Message{
+            .message_id = message_id,
+            .chat_id = chat_id,
+            .text = text,
+        };
+        
         try updates.append(update);
+        json_pos = update_end;
     }
 
     return updates;
@@ -292,83 +294,132 @@ fn trimBotMention(text: []const u8, botUsername: []const u8) []const u8 {
     return text;
 }
 
-// Send a message to a Telegram chat
+// Send a message to a Telegram chat using curl
 fn sendMessage(allocator: std.mem.Allocator, token: []const u8, chat_id: i64, text: []const u8, reply_to_message_id: i64) ![]const u8 {
     const url = try std.fmt.allocPrint(allocator, "{s}{s}/sendMessage", .{telegram_api_base_url, token});
     defer allocator.free(url);
-
-    var client = try http.Client.init(allocator);
-    defer client.deinit();
-
-    var headers = std.ArrayList(http.Header).init(allocator);
-    defer headers.deinit();
-
-    try headers.append(http.Header{ .name = "Content-Type", .value = "application/json" });
 
     const body = try std.fmt.allocPrint(allocator, 
         "{{\"chat_id\":{d},\"text\":\"{s}\",\"reply_to_message_id\":{d}}}", 
         .{chat_id, text, reply_to_message_id});
     defer allocator.free(body);
 
-    const response = try client.request(.{
-        .method = .post,
+    return try curlRequest(allocator, .{
+        .method = "POST",
         .url = url,
-        .headers = &headers,
         .body = body,
+        .headers = &[_][]const u8{"Content-Type: application/json"},
     });
-    defer response.deinit();
-
-    if (response.status_code != 200) {
-        std.debug.print("Error sending message: status code {d}\n", .{response.status_code});
-        return error.TelegramApiError;
-    }
-
-    return try response.body.toOwnedSlice(allocator);
 }
 
+// Use OpenAI API to get response
 fn query_openai(allocator: std.mem.Allocator, baseurl: []const u8, token: []const u8, model: []const u8, system_msg: []const u8, query: []const u8) ![]const u8 {
-    var client = try http.Client.init(allocator);
-    defer client.deinit();
-
-    var headers = std.ArrayList(http.Header).init(allocator);
-    defer headers.deinit();
-
-    try headers.append(http.Header{ .name = "Authorization", .value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token}) });
-    try headers.append(http.Header{ .name = "Content-Type", .value = "application/json" });
-
     const body = try std.fmt.allocPrint(allocator, 
         "{{\"model\":\"{s}\",\"messages\":[{{\"role\":\"system\",\"content\":\"{s}\"}},{{\"role\":\"user\",\"content\":\"{s}\"}}]}}", 
         .{model, system_msg, query});
     defer allocator.free(body);
 
-    const response = try client.request(.{
-        .method = .post,
-        .url = baseurl,
-        .headers = &headers,
-        .body = body,
-    });
-    defer response.deinit();
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{token});
+    defer allocator.free(auth_header);
 
-    if (response.status_code != 200) {
-        std.debug.print("Error from OpenAI API: status code {d}\n", .{response.status_code});
-        return error.OpenAIApiError;
+    const response = try curlRequest(allocator, .{
+        .method = "POST",
+        .url = baseurl,
+        .body = body,
+        .headers = &[_][]const u8{
+            "Content-Type: application/json",
+            auth_header,
+        },
+    });
+    defer allocator.free(response);
+
+    // Extract content from API response
+    const content_prefix = "\"content\":\"";
+    if (std.mem.indexOf(u8, response, content_prefix)) |content_start| {
+        const start_idx = content_start + content_prefix.len;
+        var end_idx = start_idx;
+        var escaped = false;
+        
+        // Find the closing quote, handling escaped quotes
+        while (end_idx < response.len) {
+            if (response[end_idx] == '\\') {
+                escaped = !escaped;
+            } else if (response[end_idx] == '"' and !escaped) {
+                break;
+            } else {
+                escaped = false;
+            }
+            end_idx += 1;
+        }
+        
+        if (end_idx < response.len) {
+            return try allocator.dupe(u8, response[start_idx..end_idx]);
+        }
     }
 
-    const response_body = try response.body.toOwnedSlice(allocator);
-    
-    // Parse JSON to extract the response content
-    var json_parser = std.json.Parser.init(allocator, false);
-    defer json_parser.deinit();
+    return error.InvalidResponse;
+}
 
-    var parsed_data = try json_parser.parse(response_body);
-    defer parsed_data.deinit();
-    defer allocator.free(response_body);
+// HTTP Request options
+const RequestOptions = struct {
+    method: []const u8,
+    url: []const u8,
+    body: ?[]const u8,
+    headers: []const []const u8,
+};
 
-    const root = parsed_data.root.Object;
-    const choices = root.get("choices").?.Array;
-    const first_choice = choices.items[0].Object;
-    const message = first_choice.get("message").?.Object;
-    const content = message.get("content").?.String;
+// Execute HTTP request using curl command
+fn curlRequest(allocator: std.mem.Allocator, options: RequestOptions) ![]const u8 {
+    var args = std.ArrayList([]const u8).init(allocator);
+    defer args.deinit();
+
+    try args.append("curl");
+    try args.append("-s"); // Silent mode
+    try args.append("-X");
+    try args.append(options.method);
     
-    return try allocator.dupe(u8, content);
+    // Add headers
+    for (options.headers) |header| {
+        try args.append("-H");
+        try args.append(header);
+    }
+    
+    // Add body if present
+    if (options.body) |body| {
+        try args.append("-d");
+        try args.append(body);
+    }
+    
+    // Add URL (must be last)
+    try args.append(options.url);
+    
+    // Create a child process for curl
+    var child = std.process.Child.init(args.items, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    
+    try child.spawn();
+    
+    // Read stdout
+    const stdout = try child.stdout.?.reader().readAllAlloc(allocator, 1024 * 1024); // 1MB limit
+    
+    // Wait for process to complete
+    const term = try child.wait();
+    
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.debug.print("curl exited with code {d}\n", .{code});
+                allocator.free(stdout);
+                return error.CurlFailure;
+            }
+        },
+        else => {
+            std.debug.print("curl terminated abnormally\n", .{});
+            allocator.free(stdout);
+            return error.CurlFailure;
+        },
+    }
+    
+    return stdout;
 }
