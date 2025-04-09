@@ -20,6 +20,7 @@ COPY . .
 # Build the Zig application
 RUN zig build
 
+
 # Use a minimal base image for the final container
 FROM debian:bullseye-slim
 
@@ -30,7 +31,7 @@ RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 # Copy the built binary from the build stage
-COPY --from=build /app/zig-out/bin/zigExampleBot /app/zigExampleBot
+COPY --from=build /app/zig-out/bin/app /app/zigExampleBot
 
 # Expose the port the bot will use (if applicable)
 EXPOSE 8080
